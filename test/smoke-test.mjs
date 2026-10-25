@@ -1,0 +1,396 @@
+/**
+ * dsh-chthink 冒烟测试（无框架，直接 `node test/smoke-test.mjs`）。
+ *
+ * 覆盖 README「自测 / 验收」里可离线验证的部分：
+ *   - 分区与运行时上下文注册（name / order / interpolate / 文本）；
+ *   - 模型黑名单（静态 options、agent/request 解析结果、装配期兜底）；
+ *   - 覆盖率算法（中文、英文、围栏代码块、数学符号、空文本）；
+ *   - chthink_report 的读取、继承事件切片、失败隔离、JSONL 追加；
+ *   - 返回值无损 JSON 可序列化（DSH 工具注册的硬性要求）。
+ *
+ * 真实注入效果与 DSH 重启后的行为无法在这里验证，属于安装期验收。
+ */
+
+import assert from 'node:assert/strict'
+import { readFile, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
+import { randomUUID } from 'node:crypto'
+
+import { apply, inject, name } from '../index.js'
+import { analyseCoverage, collectThinking, COVERAGE_METRIC_VERSION } from '../lib/coverage.js'
+import { matchesBlacklist, normalizeBlacklist, normalizeConfig } from '../lib/policy.js'
+
+let checks = 0
+function ok(label) {
+  checks += 1
+  console.log(`  ✓ ${label}`)
+}
+
+function assistantEvent(time, text, model = 'deepseek-flash', provider = 'acme-gateway') {
+  return {
+    type: 'assistant/message',
+    seq: 1,
+    time,
+    data: {
+      turn: 1,
+      step: 1,
+      message: {
+        role: 'assistant',
+        content: text === null ? [{ type: 'text', text: 'ok' }] : [{ type: 'reasoning', text }],
+        source: { kind: 'model', provider, model },
+      },
+      stream: [],
+    },
+  }
+}
+
+/** 递归确认返回值只含 JSON 可无损往返的值。 */
+function assertLossless(value, label = 'result') {
+  if (value === null) return
+  const type = typeof value
+  if (type === 'string' || type === 'boolean') return
+  if (type === 'number') {
+    assert.ok(Number.isFinite(value), `${label} 含非有限数字`)
+    return
+  }
+  assert.ok(type === 'object', `${label} 含不可序列化类型 ${type}`)
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => assertLossless(item, `${label}[${index}]`))
+    return
+  }
+  assert.equal(Object.getPrototypeOf(value), Object.prototype, `${label} 不是纯对象`)
+  for (const [key, child] of Object.entries(value)) assertLossless(child, `${label}.${key}`)
+}
+
+function makeContext() {
+  const ctx = {
+    sections: [],
+    contexts: [],
+    registeredTools: [],
+    listeners: new Map(),
+    injectRequests: [],
+    get(name) {
+      if (name === 'sessionQuery') return ctx.sessionQuery
+      return undefined
+    },
+    systemPrompt: {
+      section(definition) {
+        ctx.sections.push(definition)
+        return () => {}
+      },
+      context(definition) {
+        ctx.contexts.push(definition)
+        return () => {}
+      },
+    },
+    tools: {
+      register(definition) {
+        ctx.registeredTools.push(definition)
+        return () => {}
+      },
+    },
+    inject(deps, callback) {
+      ctx.injectRequests.push({ deps, callback })
+      return () => {}
+    },
+    on(event, listener) {
+      const list = ctx.listeners.get(event) ?? []
+      list.push(listener)
+      ctx.listeners.set(event, list)
+      return () => {}
+    },
+  }
+  return ctx
+}
+
+function applyPlugin(config) {
+  const ctx = makeContext()
+  apply(ctx, config)
+  return ctx
+}
+
+function activate(ctx, sessionQuery) {
+  ctx.sessionQuery = sessionQuery
+  for (const { callback } of ctx.injectRequests) callback({ sessionQuery })
+}
+
+function freshLogFile() {
+  return path.join(tmpdir(), `chthink-test-${randomUUID()}.jsonl`)
+}
+
+// ── 1. 覆盖率算法 ────────────────────────────────────────────────
+console.log('覆盖率算法')
+{
+  const chinese = analyseCoverage('我们需要先读取配置文件，然后确认服务名是否可用。')
+  assert.equal(chinese.coverage, 1)
+  assert.ok(chinese.chars > 0 && chinese.cjk === chinese.chars)
+  ok('纯中文覆盖率 = 1，标点/空白不进分母')
+
+  const english = analyseCoverage('We should read the config file first, then register the section.')
+  assert.equal(english.coverage, 0)
+  assert.ok(english.chars > 0)
+  ok('纯英文覆盖率 = 0')
+
+  const fenced = analyseCoverage('先看配置：\n```js\nconst value = foo(1, 2)\n```\n然后注册分区。')
+  assert.ok(fenced.coverage > 0.9, `实际 ${fenced.coverage}`)
+  ok('围栏代码块被剔除，不拉低覆盖率')
+
+  const unclosed = analyseCoverage('先看配置：\n```js\nconst value = 1\n')
+  assert.ok(unclosed.coverage > 0.9, `实际 ${unclosed.coverage}`)
+  ok('未闭合围栏一直剔到文末')
+
+  const digits = analyseCoverage('版本 0.2.1，共 20 个会话。')
+  assert.equal(digits.coverage, 1)
+  ok('数字不进分母')
+
+  const math = analyseCoverage('17×23 = 391，19×21 = 399。所以 19×21 更大，大 8。')
+  assert.equal(math.coverage, 1)
+  ok('数学运算符（× =）按符号剔除，纯中文数学推理不再被误判')
+
+  const superscript = analyseCoverage('面积是 20²，体积是 20³，占 ½。')
+  assert.equal(superscript.coverage, 1)
+  ok('上标/分数类数字（²、½）也不进分母')
+
+  assert.equal(analyseCoverage('').coverage, null)
+  assert.equal(analyseCoverage('，。！ \n\t').coverage, null)
+  ok('没有可计字符时 coverage = null')
+}
+
+// ── 2. collectThinking ──────────────────────────────────────────
+console.log('thinking 抽取')
+{
+  const thinking = collectThinking([
+    assistantEvent(1000, '第一段推理。'),
+    { type: 'tool/call', time: 1001, data: { name: 'ops_bash' } },
+    assistantEvent(1002, '第二段推理。', 'other-model', 'other-provider'),
+  ])
+  assert.equal(thinking.segments, 2)
+  assert.equal(thinking.model, 'other-model')
+  assert.equal(thinking.provider, 'other-provider')
+  assert.equal(thinking.lastAt, 1002)
+  assert.ok(thinking.text.includes('第一段推理') && thinking.text.includes('第二段推理'))
+  ok('多段 reasoning 合并，模型取最后一条')
+
+  const none = collectThinking([assistantEvent(1000, null)])
+  assert.equal(none.segments, 0)
+  assert.equal(none.text, '')
+  ok('没有 reasoning 时 segments = 0')
+}
+
+// ── 3. 配置与黑名单 ─────────────────────────────────────────────
+console.log('配置与黑名单')
+{
+  const config = normalizeConfig({
+    enabled: false,
+    modelBlacklist: [' a ', 'a', '', 'p/m', 3],
+    reportSessions: 999,
+    coverageThreshold: 1.7,
+  })
+  assert.equal(config.enabled, false)
+  assert.deepEqual(config.modelBlacklist, ['a', 'p/m'])
+  assert.equal(config.reportSessions, 200)
+  assert.equal(config.coverageThreshold, 1)
+  ok('黑名单去重去空，数值被夹到合法区间')
+
+  const defaults = normalizeConfig(null)
+  assert.equal(defaults.enabled, true)
+  assert.equal(defaults.reportSessions, 20)
+  assert.equal(defaults.coverageThreshold, 0.6)
+  ok('缺省值与 README 配置表一致')
+
+  assert.equal(matchesBlacklist({ provider: 'p', model: 'm' }, ['m']), true)
+  assert.equal(matchesBlacklist({ provider: 'p', model: 'm' }, ['p/m']), true)
+  assert.equal(matchesBlacklist({ provider: 'q', model: 'm' }, ['p/m']), false)
+  assert.equal(matchesBlacklist(null, ['m']), false)
+  ok('裸模型名与 provider/model 两种写法都命中')
+
+  assert.deepEqual(normalizeBlacklist('m'), [])
+  ok('非数组黑名单按空处理')
+}
+
+// ── 4. 插件注册 ─────────────────────────────────────────────────
+console.log('插件注册')
+{
+  assert.equal(name, 'chthink')
+  assert.deepEqual(inject, ['systemPrompt', 'tools'])
+
+  const ctx = applyPlugin({})
+  assert.equal(ctx.sections.length, 1)
+  const section = ctx.sections[0]
+  assert.equal(section.name, 'chthink:thinking-language')
+  assert.equal(section.order, 10300)
+  assert.equal(section.interpolate, false)
+  assert.ok(section.order > 10200, '必须排在 DEPLOYMENT_PERSONA_SUFFIX 之后')
+  assert.ok(section.text({ agent: { options: { provider: 'p', model: 'm' } } }).startsWith('[language-requirement]'))
+  assert.ok(
+    section.text({ agent: { options: { provider: 'p', model: 'm' } } }).includes('禁止用英文思考'),
+    '必须使用实测有效的强措辞',
+  )
+  assert.ok(
+    section.text({ agent: { options: { provider: 'p', model: 'm' } } }).includes('不得模仿'),
+    '必须带反风格惯性条款（长会话会被英文历史带偏）',
+  )
+
+  // 每步刷新的运行时上下文：贴近当步生成，对抗历史英文风格惯性。
+  assert.equal(ctx.contexts.length, 1)
+  const promptContext = ctx.contexts[0]
+  assert.equal(promptContext.name, 'chthink:thinking-language')
+  assert.equal(promptContext.order, 220)
+  assert.ok(promptContext.order > 210, '必须严格大于内置最大值 WEB_SURFACE = 210，确定排在快照末尾')
+  assert.equal(promptContext.interpolate, false)
+  assert.equal(promptContext.required, undefined, '不强制，尊重别的 preset 的 suppress 选择')
+  assert.ok(
+    promptContext.text({ agent: { options: { provider: 'p', model: 'm' } } }).includes('[language-requirement]'),
+  )
+
+  assert.equal(ctx.registeredTools.length, 1)
+  assert.equal(ctx.registeredTools[0].name, 'chthink_report')
+  ok('分区与运行时上下文各注册一次，工具一个，interpolate = false')
+
+  const disabled = applyPlugin({ enabled: false })
+  assert.equal(disabled.sections.length, 0)
+  assert.equal(disabled.contexts.length, 0)
+  assert.equal(disabled.registeredTools.length, 0)
+  ok('enabled=false 时不注册任何东西')
+
+  const blocked = applyPlugin({ modelBlacklist: ['bad-model'] })
+  const blockedSection = blocked.sections[0]
+  const blockedContext = blocked.contexts[0]
+  assert.equal(blockedSection.text({ agent: { options: { provider: 'p', model: 'bad-model' } } }), '')
+  assert.equal(blockedContext.text({ agent: { options: { provider: 'p', model: 'bad-model' } } }), '')
+  assert.ok(blockedSection.text({ agent: { options: { provider: 'p', model: 'good-model' } } }).length > 0)
+  assert.ok(blockedContext.text({ agent: { options: { provider: 'p', model: 'good-model' } } }).length > 0)
+  ok('黑名单命中时分区与上下文都返回空文本（空条目会被丢弃）')
+
+  // agent/request 学到解析后的模型后，后续装配即按新模型判断。
+  const requestListeners = blocked.listeners.get('agent/request') ?? []
+  assert.equal(requestListeners.length, 1)
+  const agent = { id: 's', options: { provider: 'p', model: 'good-model' } }
+  const resolved = await requestListeners[0]({ agent }, async () => ({ provider: 'p', model: 'bad-model' }))
+  assert.equal(resolved.model, 'bad-model')
+  assert.equal(blockedSection.text({ agent }), '')
+  ok('agent/request 解析出的模型会覆盖静态默认值')
+
+  // 装配期兜底：variables 已带真实模型时直接剔除分区。
+  const assembleListeners = blocked.listeners.get('system-prompt/assemble') ?? []
+  assert.equal(assembleListeners.length, 1)
+  const assembly = {
+    sections: [
+      { name: 'chthink:thinking-language', text: section.text({ agent }) },
+      { name: 'other', text: 'x' },
+    ],
+    contexts: [
+      { name: 'chthink:thinking-language', text: 'reminder' },
+      { name: 'runtime:other', text: 'y' },
+    ],
+    variables: { provider: 'p', model: 'bad-model' },
+  }
+  const filtered = await assembleListeners[0](assembly, { agent }, async () => assembly)
+  assert.deepEqual(
+    filtered.sections.map((item) => item.name),
+    ['other'],
+  )
+  assert.deepEqual(
+    filtered.contexts.map((item) => item.name),
+    ['runtime:other'],
+  )
+  ok('装配期兜底会剔除本插件的分区与运行时上下文')
+}
+
+// ── 5. chthink_report ───────────────────────────────────────────
+console.log('chthink_report')
+{
+  const chineseEvent = assistantEvent(2000, '先读配置，再确认服务名，最后注册分区。\n```js\nconst a = 1\n```')
+  const englishEvent = assistantEvent(2001, 'Read the config first, then register the section.')
+  const inheritedEvent = assistantEvent(1999, 'Parent session reasoning in English only.')
+
+  const snapshots = {
+    'session-cn': { inheritedEventCount: 0, events: [chineseEvent, assistantEvent(2002, '第二段中文推理，继续确认边界。')] },
+    'session-en': { inheritedEventCount: 0, events: [englishEvent] },
+    'session-seeded': { inheritedEventCount: 1, events: [inheritedEvent, chineseEvent] },
+    'session-empty': { inheritedEventCount: 0, events: [assistantEvent(2003, null)] },
+  }
+
+  const query = {
+    async listSessions() {
+      return ['session-cn', 'session-en', 'session-seeded', 'session-empty', 'session-broken'].map((id, index) => ({
+        header: { id, cwd: 'D:/work/chthink', createdAt: index },
+        live: false,
+        persisted: true,
+      }))
+    },
+    async readSession(id) {
+      if (id === 'session-broken') throw new Error('replay validation failed')
+      return snapshots[id]
+    },
+  }
+
+  const logFile = freshLogFile()
+  const ctx = applyPlugin({ logFile })
+  activate(ctx, query)
+  const tool = ctx.registeredTools[0]
+  const result = await tool.execute({ sessions: 10 })
+
+  assertLossless(result)
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(result)), result)
+  ok('返回值无损 JSON 可序列化')
+
+  assert.equal(result.ok, true)
+  assert.equal(result.metricVersion, COVERAGE_METRIC_VERSION)
+  assert.equal(result.scannedSessions, 5)
+  assert.equal(result.unreadable, 1)
+  assert.equal(result.sessionsWithThinking, 3)
+  assert.equal(result.sessionsWithoutThinking, 1)
+  assert.equal(result.failedSessions, 1)
+  // 三个有 thinking 的会话里有一个纯英文，总体覆盖率被它拉低；
+  // 单个中文会话仍各自通过。这正是「按会话判 failed、按总体看趋势」的口径。
+  assert.ok(
+    result.overallCoverage > 0.5 && result.overallCoverage < result.threshold,
+    `实际 ${result.overallCoverage}`,
+  )
+  ok('读取、失败隔离、失败会话计数正确')
+
+  const seeded = result.sessions.find((entry) => entry.sessionId === 'session-seeded')
+  assert.ok(seeded.coverage > 0.9, `继承事件未被剔除：${seeded.coverage}`)
+  ok('继承的父会话事件被剔除，不污染本会话覆盖率')
+
+  const failing = result.sessions.find((entry) => entry.sessionId === 'session-en')
+  assert.equal(failing.failed, true)
+  assert.equal(failing.coverage, 0)
+  const passing = result.sessions.find((entry) => entry.sessionId === 'session-cn')
+  assert.equal(passing.failed, false)
+  ok('failed 标记按阈值判定，覆盖中文/英文两端')
+
+  const raw = await readFile(logFile, 'utf8')
+  const lines = raw.trim().split('\n').map((line) => JSON.parse(line))
+  assert.equal(lines.length, 3)
+  for (const line of lines) {
+    for (const key of ['ts', 'metricVersion', 'sessionId', 'chars', 'coverage', 'failed']) assert.ok(key in line, `缺字段 ${key}`)
+    assert.equal(line.metricVersion, COVERAGE_METRIC_VERSION)
+    assert.ok(['session-cn', 'session-en', 'session-seeded'].includes(line.sessionId))
+  }
+  assert.equal(result.logWritten, 3)
+  ok('JSONL 每个有 thinking 的会话追加一行，字段与 README 日志格式一致')
+
+  // 不写日志 & 会话数上限
+  const quietLog = freshLogFile()
+  const quiet = applyPlugin({ logFile: quietLog })
+  activate(quiet, query)
+  const limited = await quiet.registeredTools[0].execute({ sessions: 2, writeLog: false })
+  assert.equal(limited.scannedSessions, 2)
+  assert.equal(limited.logWritten, 0)
+  await assert.rejects(readFile(quietLog, 'utf8'))
+  ok('writeLog=false 不落盘，sessions 参数限制扫描数')
+
+  // 会话服务缺席
+  const missing = applyPlugin({})
+  const unavailable = await missing.registeredTools[0].execute({})
+  assert.equal(unavailable.ok, false)
+  assertLossless(unavailable)
+  ok('sessionQuery 缺席时如实返回 ok:false')
+
+  await rm(logFile, { force: true })
+}
+
+console.log(`\n全部通过（${checks} 项检查）。`)

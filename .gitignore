@@ -1,0 +1,19 @@
+# 开发期脚手架：读宿主安装包核实 API、跑措辞 A/B 度量。
+# 它们含本机绝对路径与真实 sessionId，不随插件发布。
+/tools/
+
+# 依赖与构建产物
+node_modules/
+package-lock.json
+pnpm-lock.yaml
+yarn.lock
+
+# 运行期日志与本地状态
+*.log
+*.jsonl
+
+# 编辑器 / 系统
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

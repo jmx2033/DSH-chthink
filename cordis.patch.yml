@@ -1,0 +1,8 @@
+- insert:
+    - id: chthink
+      name: '@local/dsh-chthink'
+      config:
+        enabled: true
+        modelBlacklist: []
+        reportSessions: 20
+        coverageThreshold: 0.6

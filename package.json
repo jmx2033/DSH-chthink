@@ -1,0 +1,30 @@
+{
+  "name": "@local/dsh-chthink",
+  "version": "0.2.3",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "description": "让 DSH 的思考内容（思维链）以简体中文产出：系统提示词注入 + 离线覆盖率报告。",
+  "exports": {
+    ".": "./index.js",
+    "./lib/coverage.js": "./lib/coverage.js",
+    "./lib/policy.js": "./lib/policy.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "lib/coverage.js",
+    "lib/policy.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
