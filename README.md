@@ -107,6 +107,8 @@ DSH 会把 runtime context 渲染成一条 `Current runtime context…` 的**用
 
 ### 覆盖率口径（v3）
 
+> 设计依据、完整实测对照与已知局限见 [docs/coverage-v3.md](docs/coverage-v3.md)。
+
 v2 的单一比值有一个**测量缺陷**：它把 `ops_bash`、`Python`、`get_tree()` 这类标识符和真正的英文推理句子算成同一种东西（都是「非汉字」）。编码会话里标识符密度很高，模型明明遵循了要求，比值却被压到 0.4–0.5，误判成失效。
 
 v3 按「词」把非汉字部分拆开，输出三个互斥量：
