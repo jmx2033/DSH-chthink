@@ -157,6 +157,65 @@ console.log('覆盖率算法')
   ok('没有可计字符时 coverage = null')
 }
 
+// ── 1b. v3：把「英文句子」与「被豁免的标识符」拆开 ─────────────────
+console.log('v3 片段分类')
+{
+  // 中文思考里夹标识符：v2 会压低覆盖率，v3 必须判成完全遵循
+  const identifiers = analyseCoverage(
+    '任务：统计 1 到 20000 之间素数的个数，要用实际计算。用 Python 或者简单脚本跑一下。用 ops_bash 跑一段 Python 或 awk。我用 Python 做埃拉托斯特尼筛法。',
+  )
+  assert.equal(identifiers.chineseRatio, 1, `标识符被误判成英文句子：${identifiers.chineseRatio}`)
+  assert.equal(identifiers.englishChars, 0)
+  assert.ok(identifiers.identifierChars > 20, '标识符应计入 identifierChars')
+  assert.ok(identifiers.coverage < 1, 'v2 口径仍应偏低（证明两者确有差异）')
+  ok('中文 + 标识符：v3 判 100% 遵循，v2 偏低')
+
+  // 函数调用连写不能被当成英文行文（primepi(20000) 与 len(primerange(...))）
+  const calls = analyseCoverage(
+    '再用 sympy 的 primepi(20000) 与 len(primerange(1, 20001)) 作第三方交叉核对，同样得 2262，三者一致。',
+  )
+  assert.equal(calls.chineseRatio, 1, `函数调用被误判：englishChars=${calls.englishChars}`)
+  ok('函数调用与括号紧贴的标识符不算英文句子')
+
+  // 真英文句子必须被抓出来
+  const english = analyseCoverage(
+    '先看配置。Wait, I need to double check one thing before we proceed, does it get injected into every step? 然后继续。',
+  )
+  assert.ok(english.chineseRatio < 0.2, `英文句子未被识别：${english.chineseRatio}`)
+  assert.ok(english.englishChars > 50, '英文字符应计入 englishChars')
+  assert.ok(english.englishSegments >= 1)
+  ok('中文夹完整英文句子：v3 判为违规')
+
+  // 全英文
+  const pure = analyseCoverage('We should read the config file first, then register the section.')
+  assert.equal(pure.chineseRatio, 0)
+  assert.equal(pure.englishSentenceRatio, 1)
+  ok('纯英文 reasoning：chineseRatio = 0，englishSentenceRatio = 1')
+
+  // 纯标识符片段（无虚词、无三连 plain 词）保持豁免
+  const onlyIds = analyseCoverage('调用 get_tree().paused 后 _process 停止，process_mode 为 ALWAYS。')
+  assert.equal(onlyIds.chineseRatio, 1, `点号/下划线标识符被误判：${onlyIds.chineseRatio}`)
+  ok('点号与下划线形态的标识符不参与英文句子判定')
+
+  // 无信号词但连续 3 个以上普通英文词 → 判英文（保守兜底）
+  const run = analyseCoverage('这里需要 check the value again 然后继续处理。')
+  assert.ok(run.chineseRatio < 0.8, `连续英文词未被识别：${run.chineseRatio}`)
+  ok('连续普通英文词触发英文句子判定')
+
+  // 行内代码整段剔除
+  const inline = analyseCoverage('调用 `get_tree().paused = true` 之后节点停止处理，我们验证一下。')
+  assert.equal(inline.chineseRatio, 1)
+  ok('行内代码在 v3 里整段剔除')
+
+  // 三个占比与 chars 的自洽性
+  const sample = analyseCoverage('统计 1 到 20000 之间素数的个数，用 Python 跑 ops_bash 验证。')
+  assert.ok(sample.hanChars + sample.englishChars + sample.identifierChars <= sample.chars)
+  assert.equal(sample.englishChars, 0)
+  assert.equal(sample.chineseRatio, 1)
+  assert.ok(sample.identifierRatio > 0 && sample.identifierRatio < 1)
+  ok('han/english/identifier 三段互斥且与 chineseRatio 自洽')
+}
+
 // ── 2. collectThinking ──────────────────────────────────────────
 console.log('thinking 抽取')
 {

@@ -103,33 +103,65 @@ DSH 会把 runtime context 渲染成一条 `Current runtime context…` 的**用
 - 参数 `sessions`：扫描最近多少个会话（默认取配置）；
 - 参数 `writeLog`：是否追加日志（默认 `true`）。
 
-返回每个会话的 `chars / cjk / coverage / failed / provider / model`、总体覆盖率、未达标会话数，以及 JSONL 写入结果。会话日志通过宿主的 `sessionQuery` 服务只读回放，不改写任何会话文件。
+返回每个会话的 `hanChars / englishChars / identifierChars / chineseRatio / coverage / failed / provider / model`、总体三项占比、未达标会话数，以及 JSONL 写入结果。会话日志通过宿主的 `sessionQuery` 服务只读回放，不改写任何会话文件。
 
-### 覆盖率口径（v2）
+### 覆盖率口径（v3）
+
+v2 的单一比值有一个**测量缺陷**：它把 `ops_bash`、`Python`、`get_tree()` 这类标识符和真正的英文推理句子算成同一种东西（都是「非汉字」）。编码会话里标识符密度很高，模型明明遵循了要求，比值却被压到 0.4–0.5，误判成失效。
+
+v3 按「词」把非汉字部分拆开，输出三个互斥量：
 
 ```
-coverage = count(CJK 统一表意文字) / count(自然语言字符)
-自然语言字符 = 全部字符 − 围栏代码块内字符 − 数字 − 标点 − 空白 − 符号
+hanChars           汉字字符
+englishChars       英文句子片段里的拉丁字符   ← 真正的违规量
+identifierChars    标识符与专名字符           ← 豁免，不计违规
+
+chineseRatio          = hanChars / (hanChars + englishChars)   ← 判定用这个
+englishSentenceRatio  = englishChars / chars
+identifierRatio       = identifierChars / chars
+coverage              = cjk / chars（v2 原样保留，便于与旧日志对比）
 ```
 
-实现细节：
+`failed` 由 `chineseRatio < coverageThreshold` 判定。片段判定规则：
+
+1. 以汉字与代码符号为界切成「拉丁片段」——`_` `.` `/` `(` `=` 等都会断开片段，所以 `primepi(20000)` 与 `len(primerange(1, 20001))` 不会被粘成一句；
+2. 片段内含英文虚词或高频动词（the / of / is / let / we / I …）→ 英文句子；
+3. 否则片段有 ≥3 个连续普通英文词 → 英文句子；
+4. 否则 → 标识符（豁免）。
+
+词级预分类优先于词义：含 `_ - . / : @ \` 或数字、驼峰、全大写形态（`ALWAYS`、`JSON`）一律先算标识符——否则 `ALWAYS` 会命中副词 always 而被误判成英文。围栏代码块与行内代码在 v3 里整段剔除。
+
+**阈值标定**（本机 76 个会话、25 条模型路由、约 1.1 万段 reasoning）：v3 的 `chineseRatio` 呈明显双峰——遵循良好的一组 0.82–0.99，失效的一组 0.004–0.56，中间是空档。默认阈值 `0.6` 正落在空档里，无需调整。
+
+v2 的失真幅度（同一批真实数据）：
+
+| 路由 | v2 coverage | v3 chineseRatio | 结论 |
+|---|---:|---:|---|
+| `codearts/deepseek-v4.1-flash` | 0.607 | **0.955** | v2 判 failed，实际遵循良好（标识符占 24%） |
+| `workbuddy/cn:deepseek-v4.1-flash` | 0.566 | **0.955** | 同上（标识符占 34%） |
+| `trae/deepseek-v4.1-flash` | 0.506 | **0.951** | 同上 |
+| `loomy/spark-x2.6` | 0.201 | 0.237 | 两口径都判失效，结论不变 |
+| `acme-gateway/kimi-k3` | 0.032 | 0.037 | 同上 |
+
+即 v2 只冤枉了「中文为主 + 标识符密集」的模型，没有漏判真正失效的。
+
+其他实现细节：
 
 - 围栏代码块（``` / ~~~）整段剔除；未闭合的围栏一直剔到文末；
-- **口径 v2（2026-10-23）**：分母再排除 Unicode 符号（`\p{S}`，数学运算符 `= × +`、箭头、emoji 等），数字按 `\p{N}` 全量排除（含 `²`、`½`）。原因：这些字符不是自然语言，却会把明确是中文的数学推理压到 0.55 左右、被 0.6 阈值误判。真实样本实测 `0.5570 → 0.8980`，散文与英文样本不受影响；
-- 口径版本写进日志行的 `metricVersion` 字段。v1 旧行（没有该字段）不能与 v2 直接比较；
-- 行内代码不剔除（口径只排除「代码块」），所以路径、工具名会进入分母，压低一点覆盖率——偏保守；
+- 数字按 `\p{N}` 全量排除（含 `²`、`½`），符号按 `\p{S}` 排除（`= × +`、箭头、emoji）；
+- 口径版本写进日志行的 `metricVersion` 字段。v1/v2 旧行不能与 v3 的 `chineseRatio` 直接比较；
 - 子会话/分支会重放父会话历史，统计时按 `inheritedEventCount` 只算本会话自己的事件；
-- 没有 thinking 内容的会话 `coverage = null`，不计入 failed。
+- 没有 thinking 内容的会话比值为 `null`，不计入 failed。
 
 ### 日志格式
 
 `~/.dsh/chthink/log.jsonl`，每次报告为每个「有 thinking」的会话追加一行：
 
 ```json
-{"ts":"2026-10-23T17:00:00.000Z","metricVersion":2,"sessionId":"…","provider":"acme-gateway","model":"deepseek-flash","chars":1820,"cjk":1765,"coverage":0.9698,"failed":false,"segments":12}
+{"ts":"2026-11-15T03:55:00.000Z","metricVersion":3,"sessionId":"…","provider":"acme-gateway","model":"deepseek-flash","chars":1820,"cjk":1200,"coverage":0.6593,"hanChars":1200,"englishChars":60,"identifierChars":520,"englishSegments":2,"chineseRatio":0.9524,"englishSentenceRatio":0.033,"identifierRatio":0.2857,"failed":false,"segments":12}
 ```
 
-`metricVersion` 缺失表示口径 v1（2026-10-23 之前的样本）；升级口径后旧行仍然保留，但 `coverage` 不能直接与 v2 比较。
+`metricVersion` 标记口径代际（缺省为 v1，`2` 为 v2，`3` 为当前 v3）。旧行保留不删，但 v1/v2 的 `coverage` 不能与 v3 的 `chineseRatio` 直接比较——两者判定标准不同。
 
 用途只有一个：跑几天后人工回看，把持续 `failed: true` 的模型加入 `modelBlacklist`，并据此微调注入措辞。无上报、无面板。
 

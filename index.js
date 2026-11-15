@@ -280,6 +280,9 @@ export function apply(ctx, rawConfig = {}) {
       const unreadableDetails = []
       let totalChars = 0
       let totalCjk = 0
+      let totalHan = 0
+      let totalEnglish = 0
+      let totalIdentifier = 0
 
       for (const record of list) {
         const header = record && typeof record === 'object' && record.header && typeof record.header === 'object' ? record.header : {}
@@ -312,17 +315,32 @@ export function apply(ctx, rawConfig = {}) {
           chars: stats.chars,
           cjk: stats.cjk,
           coverage: stats.coverage,
-          failed: stats.coverage !== null && stats.coverage < threshold,
+          // v3：汉字/(汉字+英文句子)，标识符不参与判定；failed 由它决定
+          hanChars: stats.hanChars,
+          englishChars: stats.englishChars,
+          identifierChars: stats.identifierChars,
+          englishSegments: stats.englishSegments,
+          chineseRatio: stats.chineseRatio,
+          englishSentenceRatio: stats.englishSentenceRatio,
+          identifierRatio: stats.identifierRatio,
+          failed: stats.chineseRatio !== null && stats.chineseRatio < threshold,
           lastAt: thinking.lastAt > 0 ? new Date(thinking.lastAt).toISOString() : null,
         })
 
         totalChars += stats.chars
         totalCjk += stats.cjk
+        totalHan += stats.hanChars
+        totalEnglish += stats.englishChars
+        totalIdentifier += stats.identifierChars
       }
 
       const withThinking = sessions.filter((entry) => entry.segments > 0)
       const failedSessions = withThinking.filter((entry) => entry.failed)
       const overallCoverage = totalChars === 0 ? null : round4(totalCjk / totalChars)
+      const judgedChars = totalHan + totalEnglish
+      const overallChineseRatio = judgedChars === 0 ? null : round4(totalHan / judgedChars)
+      const overallEnglishSentenceRatio = totalChars === 0 ? null : round4(totalEnglish / totalChars)
+      const overallIdentifierRatio = totalChars === 0 ? null : round4(totalIdentifier / totalChars)
 
       let logWritten = 0
       let logError = null
@@ -337,6 +355,13 @@ export function apply(ctx, rawConfig = {}) {
           chars: entry.chars,
           cjk: entry.cjk,
           coverage: entry.coverage,
+          hanChars: entry.hanChars,
+          englishChars: entry.englishChars,
+          identifierChars: entry.identifierChars,
+          englishSegments: entry.englishSegments,
+          chineseRatio: entry.chineseRatio,
+          englishSentenceRatio: entry.englishSentenceRatio,
+          identifierRatio: entry.identifierRatio,
           failed: entry.failed,
           segments: entry.segments,
         }))
@@ -349,7 +374,8 @@ export function apply(ctx, rawConfig = {}) {
 
       const parts = [
         `扫描 ${list.length} 个会话：${withThinking.length} 个有 thinking 内容`,
-        `总体覆盖率 ${overallCoverage === null ? 'n/a' : overallCoverage.toFixed(4)}（阈值 ${threshold}）`,
+        `中文占比 ${overallChineseRatio === null ? 'n/a' : overallChineseRatio.toFixed(4)}（阈值 ${threshold}）`,
+        `英文句子占比 ${overallEnglishSentenceRatio === null ? 'n/a' : overallEnglishSentenceRatio.toFixed(4)}，标识符占比 ${overallIdentifierRatio === null ? 'n/a' : overallIdentifierRatio.toFixed(4)}`,
         `${failedSessions.length} 个未达标`,
       ]
       if (unreadableDetails.length > 0) parts.push(`${unreadableDetails.length} 个读不出`)
@@ -373,7 +399,13 @@ export function apply(ctx, rawConfig = {}) {
         unreadableDetails,
         totalChars,
         totalCjk,
+        totalHan,
+        totalEnglish,
+        totalIdentifier,
         overallCoverage,
+        overallChineseRatio,
+        overallEnglishSentenceRatio,
+        overallIdentifierRatio,
         failedSessions: failedSessions.length,
         sessions,
         injection: {
