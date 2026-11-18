@@ -307,6 +307,17 @@ console.log('插件注册')
   assert.equal(ctx.registeredTools[0].name, 'chthink_report')
   ok('分区与运行时上下文各注册一次，工具一个，interpolate = false')
 
+  // runtimeContext=false：只关通道2，主通道（系统提示词分区）必须保留。
+  const noCtx = applyPlugin({ runtimeContext: false })
+  assert.equal(noCtx.sections.length, 1, '主通道应仍在')
+  assert.equal(noCtx.contexts.length, 0, 'runtimeContext=false 应关掉通道2')
+  assert.equal(noCtx.registeredTools.length, 1, '报告工具不受影响')
+  ok('runtimeContext=false 只关通道2，主通道与工具保留')
+
+  // 默认（不写该键）两通道都在
+  assert.equal(applyPlugin({}).contexts.length, 1, '默认应开通道2')
+  ok('runtimeContext 默认开启')
+
   const disabled = applyPlugin({ enabled: false })
   assert.equal(disabled.sections.length, 0)
   assert.equal(disabled.contexts.length, 0)
@@ -450,6 +461,79 @@ console.log('chthink_report')
   ok('sessionQuery 缺席时如实返回 ok:false')
 
   await rm(logFile, { force: true })
+}
+
+// ── 6. 按模型聚合（折中方案：会话均值判定 + 注入在场区分 + 拉黑候选）─────
+console.log('模型聚合与拉黑候选')
+{
+  const zh = '先读取配置文件然后注册分区并确认排序规则是否正确。'
+  const en = 'We should read the config file first then register the section before assembling the prompt.'
+  const inject = { type: 'system/message', time: 1, data: { message: { content: [{ type: 'text', text: '[language-requirement] 生效' }] } } }
+  const noInject = { type: 'system/message', time: 1, data: { message: { content: [{ type: 'text', text: '没有语言要求' }] } } }
+  const snap = (events) => ({ inheritedEventCount: 0, events })
+
+  const routeSnapshots = {
+    // 遵循良好：3 会话全中文、注入在场
+    'g1': snap([inject, assistantEvent(2, zh, 'good', 'p')]),
+    'g2': snap([inject, assistantEvent(2, zh, 'good', 'p')]),
+    'g3': snap([inject, assistantEvent(2, zh, 'good', 'p')]),
+    // 不遵循：3 会话全英文、注入在场 → 进候选
+    'b1': snap([inject, assistantEvent(2, en, 'bad', 'p')]),
+    'b2': snap([inject, assistantEvent(2, en, 'bad', 'p')]),
+    'b3': snap([inject, assistantEvent(2, en, 'bad', 'p')]),
+    // 样本不足：1 会话英文 → conclusive=false，不进候选
+    'f1': snap([inject, assistantEvent(2, en, 'few', 'p')]),
+    // 从未注入：3 会话英文但无 marker → 不能算模型不遵循，不进候选
+    'n1': snap([noInject, assistantEvent(2, en, 'noinject', 'p')]),
+    'n2': snap([noInject, assistantEvent(2, en, 'noinject', 'p')]),
+    'n3': snap([noInject, assistantEvent(2, en, 'noinject', 'p')]),
+    // 均值 vs 加权：2 会话中文(各1段) + 1 会话英文(5段)。
+    // 会话均值 = (1+1+0)/3 ≈ 0.667；加权会被 5 段英文拉到接近 0。
+    'm1': snap([inject, assistantEvent(2, zh, 'mix', 'p')]),
+    'm2': snap([inject, assistantEvent(2, zh, 'mix', 'p')]),
+    'm3': snap([inject, ...Array.from({ length: 5 }, (_, i) => assistantEvent(10 + i, en, 'mix', 'p'))]),
+  }
+  const ids = Object.keys(routeSnapshots)
+  const query = {
+    async listSessions() {
+      return ids.map((id, index) => ({ header: { id, cwd: '/w', createdAt: index }, live: false, persisted: true }))
+    },
+    async readSession(id) {
+      return routeSnapshots[id]
+    },
+  }
+
+  const ctx = applyPlugin({ logFile: freshLogFile() })
+  activate(ctx, query)
+  const result = await ctx.registeredTools[0].execute({ sessions: 40, writeLog: false })
+
+  assertLossless(result)
+  const byRoute = Object.fromEntries(result.models.map((m) => [m.route, m]))
+
+  // 注入在场标记
+  assert.equal(byRoute['p/good'].injectedSessions, 3, 'good 应识别 3 个注入会话')
+  assert.equal(byRoute['p/noinject'].injectedSessions, 0, 'noinject 不应算注入在场')
+  ok('区分「注入在场」与「从未注入」')
+
+  // 会话均值，不受段数主导
+  assert.ok(
+    byRoute['p/mix'].meanChineseRatio > 0.6 && byRoute['p/mix'].meanChineseRatio < 0.7,
+    `应≈0.667(均值)，实际 ${byRoute['p/mix'].meanChineseRatio}`,
+  )
+  ok('遵循度用会话均值，不被少数超长英文段主导')
+
+  // 拉黑候选：只有 bad 进，few/noinject/good/mix 都不进
+  assert.ok(result.blacklistCandidates.includes('p/bad'), 'bad 应进候选')
+  assert.ok(!result.blacklistCandidates.includes('p/few'), '样本不足不该进候选')
+  assert.ok(!result.blacklistCandidates.includes('p/noinject'), '从未注入不该进候选')
+  assert.ok(!result.blacklistCandidates.includes('p/good'), '遵循的不该进候选')
+  assert.equal(byRoute['p/few'].conclusive, false)
+  ok('拉黑候选只含「样本充足+注入在场+均值不达标」的路由')
+
+  // 候选不自动改配置，只列出
+  assert.ok(Array.isArray(result.blacklistCandidates))
+  assert.equal(result.injection.modelBlacklist.length, 0, '候选不写回 modelBlacklist')
+  ok('候选仅供人工确认，不自动写入配置')
 }
 
 console.log(`\n全部通过（${checks} 项检查）。`)

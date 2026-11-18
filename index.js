@@ -94,6 +94,34 @@ const CONTEXT_TEXT =
 const DEFAULT_LOG_FILE = path.join(homedir(), '.dsh', 'chthink', 'log.jsonl')
 const TOOL_NAME = 'chthink_report'
 
+/**
+ * 注入在场探针。两条通道的文本都以它开头；runtime context 快照落在
+ * user/message 侧，所以只扫 system/message 就等价于「主通道装配过」。
+ */
+const INJECT_PROBE = '[language-requirement]'
+
+/**
+ * 判定某条路由「遵循/不遵循」所需的最少会话数。
+ * 低于它只报 inconclusive，不进拉黑候选——凭 1–2 个会话拉黑一个模型是误判，
+ * 尤其模型 id 会改名、历史样本可能来自旧配置。
+ */
+const MIN_ROUTE_SAMPLES = 3
+
+/**
+ * 该会话是否真的装配出过含注入的系统提示词。
+ *
+ * 为什么必须分开统计：加权覆盖率把「注入之前的历史样本」和「注入之后但不遵循」
+ * 混成一个数。本机实测 kimi 注入在场 31.1%、qfmodel 注入在场 59.7%，而它们的
+ * 加权总值分别只有 3.7% / 40.8% —— 不区分就会把「没注入过」误判成「不遵循」。
+ */
+function sessionWasInjected(events) {
+  for (const event of events) {
+    if (!event || typeof event !== 'object' || event.type !== 'system/message') continue
+    if (JSON.stringify(event).includes(INJECT_PROBE)) return true
+  }
+  return false
+}
+
 /** 单条错误原因进返回值前截断，避免把栈或超长路径塞进上下文。 */
 function errorMessage(error, max = 200) {
   const text = error instanceof Error ? error.message : String(error)
@@ -201,15 +229,20 @@ export function apply(ctx, rawConfig = {}) {
   //
   // 不设 required：别的 preset 若显式 suppress 运行时上下文，那是用户的选择，
   // 这里不强行挤进去；此时主通道（系统提示词分区）仍然生效。
-  ctx.systemPrompt.context({
-    name: CONTEXT_NAME,
-    order: CONTEXT_ORDER,
-    text: (context) => {
-      const agent = context && typeof context === 'object' ? (context.agent ?? context.scope) : undefined
-      return matchesBlacklist(resolveRoute(agent), blacklist) ? '' : CONTEXT_TEXT
-    },
-    interpolate: false,
-  })
+  //
+  // runtimeContext=false 可整体关掉本通道（配置项，默认开）。关掉后只剩主通道，
+  // 用于宿主不再每步重投影、或想省 129 字符/步的场景。
+  if (config.runtimeContext) {
+    ctx.systemPrompt.context({
+      name: CONTEXT_NAME,
+      order: CONTEXT_ORDER,
+      text: (context) => {
+        const agent = context && typeof context === 'object' ? (context.agent ?? context.scope) : undefined
+        return matchesBlacklist(resolveRoute(agent), blacklist) ? '' : CONTEXT_TEXT
+      },
+      interpolate: false,
+    })
+  }
 
   // 可选的会话读取通道：服务缺席时插件照常注入，只是报告工具如实报错。
   let sessionQuery
@@ -305,12 +338,14 @@ export function apply(ctx, rawConfig = {}) {
 
         const thinking = collectThinking(ownEvents)
         const stats = analyseCoverage(thinking.text)
+        const injected = sessionWasInjected(ownEvents)
 
         sessions.push({
           sessionId,
           cwd: typeof header.cwd === 'string' ? header.cwd : null,
           provider: thinking.provider,
           model: thinking.model,
+          injected,
           segments: thinking.segments,
           chars: stats.chars,
           cjk: stats.cjk,
@@ -341,6 +376,67 @@ export function apply(ctx, rawConfig = {}) {
       const overallChineseRatio = judgedChars === 0 ? null : round4(totalHan / judgedChars)
       const overallEnglishSentenceRatio = totalChars === 0 ? null : round4(totalEnglish / totalChars)
       const overallIdentifierRatio = totalChars === 0 ? null : round4(totalIdentifier / totalChars)
+
+      // 按模型聚合。判定一律用**会话均值**而非加权：加权会被少数超长英文段主导，
+      // 本机实测 qfmodel 加权 0.408 / 会话均值 0.597，spark-x2.6 加权 0.237 /
+      // 均值 0.538 —— 用加权会误判成失效并误拉黑。会话均值才代表典型体验。
+      const byRoute = new Map()
+      for (const entry of withThinking) {
+        if (entry.chineseRatio === null) continue
+        const provider = typeof entry.provider === 'string' && entry.provider ? entry.provider : '(unknown)'
+        const model = typeof entry.model === 'string' && entry.model ? entry.model : '(unknown)'
+        const route = `${provider}/${model}`
+        const group = byRoute.get(route) ?? {
+          route,
+          provider,
+          model,
+          sessions: 0,
+          injectedSessions: 0,
+          ratios: [],
+          injectedRatios: [],
+          segments: 0,
+        }
+        group.sessions += 1
+        group.segments += entry.segments
+        group.ratios.push(entry.chineseRatio)
+        if (entry.injected) {
+          group.injectedSessions += 1
+          group.injectedRatios.push(entry.chineseRatio)
+        }
+        byRoute.set(route, group)
+      }
+
+      const meanOf = (values) =>
+        values.length === 0 ? null : round4(values.reduce((a, b) => a + b, 0) / values.length)
+
+      const models = []
+      for (const group of byRoute.values()) {
+        // 只用「注入在场」的会话判定遵循度：没注入过的会话不能算模型不遵循。
+        const judged = group.injectedRatios.length > 0 ? group.injectedRatios : group.ratios
+        const mean = meanOf(judged)
+        const lowSample = judged.length < MIN_ROUTE_SAMPLES
+        models.push({
+          route: group.route,
+          sessions: group.sessions,
+          injectedSessions: group.injectedSessions,
+          segments: group.segments,
+          meanChineseRatio: mean,
+          // 样本不足时不给结论，避免凭 1–2 个会话拉黑一个模型
+          conclusive: !lowSample,
+          follows: mean === null ? null : mean >= threshold,
+        })
+      }
+      models.sort((a, b) => {
+        if (a.meanChineseRatio === null) return 1
+        if (b.meanChineseRatio === null) return -1
+        return a.meanChineseRatio - b.meanChineseRatio
+      })
+
+      // 拉黑候选：样本充足、注入确实在场、会话均值仍低于阈值。
+      // 只列出来供人工确认，不自动改配置——模型 id 会改名，自动写入会静默失效。
+      const blacklistCandidates = models
+        .filter((m) => m.conclusive && m.injectedSessions > 0 && m.follows === false)
+        .map((m) => m.route)
 
       let logWritten = 0
       let logError = null
@@ -375,9 +471,12 @@ export function apply(ctx, rawConfig = {}) {
       const parts = [
         `扫描 ${list.length} 个会话：${withThinking.length} 个有 thinking 内容`,
         `中文占比 ${overallChineseRatio === null ? 'n/a' : overallChineseRatio.toFixed(4)}（阈值 ${threshold}）`,
-        `英文句子占比 ${overallEnglishSentenceRatio === null ? 'n/a' : overallEnglishSentenceRatio.toFixed(4)}，标识符占比 ${overallIdentifierRatio === null ? 'n/a' : overallIdentifierRatio.toFixed(4)}`,
-        `${failedSessions.length} 个未达标`,
+        `标识符占比 ${overallIdentifierRatio === null ? 'n/a' : overallIdentifierRatio.toFixed(4)}`,
+        `${models.length} 条模型路由，其中 ${models.filter((m) => m.conclusive && m.follows === true).length} 条遵循、${models.filter((m) => m.conclusive && m.follows === false).length} 条不遵循、${models.filter((m) => !m.conclusive).length} 条样本不足`,
       ]
+      if (blacklistCandidates.length > 0) {
+        parts.push(`拉黑候选 ${blacklistCandidates.length} 条：${blacklistCandidates.join(', ')}`)
+      }
       if (unreadableDetails.length > 0) parts.push(`${unreadableDetails.length} 个读不出`)
       if (writeLog) {
         parts.push(logError ? `日志写入失败：${logError}` : `已追加 ${logWritten} 行到 ${logFile}`)
@@ -407,6 +506,11 @@ export function apply(ctx, rawConfig = {}) {
         overallEnglishSentenceRatio,
         overallIdentifierRatio,
         failedSessions: failedSessions.length,
+        routeCount: models.length,
+        // 会话均值口径的模型级结论：判定遵循度看这里，不要看 overall*
+        models,
+        blacklistCandidates,
+        minRouteSamples: MIN_ROUTE_SAMPLES,
         sessions,
         injection: {
           sectionName: SECTION_NAME,
