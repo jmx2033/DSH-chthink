@@ -1,6 +1,8 @@
-# 开发期脚手架：读宿主安装包核实 API、跑措辞 A/B 度量。
-# 它们含本机绝对路径与真实 sessionId，不随插件发布。
-/tools/
+# tools/ 默认不入库（开发期一次性脚本，含本机路径/会话 id 的不外传）。
+# 例外：README/docs 引用、可复现核心结论的两个脚本入库。
+/tools/*
+!/tools/model-census.mjs
+!/tools/freshness-vs-compliance.mjs
 
 # 依赖与构建产物
 node_modules/
